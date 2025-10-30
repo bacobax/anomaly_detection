@@ -1,4 +1,6 @@
 """
+Main Anomaly Detection Model Class
+
 Refactored Model Class with SOLID Principles and ML Development Best Practices
 
 SOLID Principles Applied:
@@ -21,699 +23,20 @@ ML Best Practices:
 import numpy as np
 import torch
 import pickle
-import json
 import warnings
 from pathlib import Path
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Tuple, Union, List, Any
-from sklearn.decomposition import PCA
-from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
 from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
 import logging
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-from .VAE import VAEonCLIP, train_vae, vae_reduce_mu, vae_loss_per_sample
+from .configs import ModelConfig, PCAConfig, VAEConfig, GMMConfig, ThresholdConfig
+from .reducers import FeatureReducer, PCAReducer, VAEReducer
+from .scorers import AnomalyScorer, GMMScorer, ReconstructionScorer, HybridScorer
+from .threshold import ThresholdCalibrator
+from .utils import setup_logger, save_test_visualizations, save_metrics_report, plot_model_2d_visualization
 
-
-# ============================================================================
-# Configuration Classes (Replaces long parameter lists)
-# ============================================================================
-
-@dataclass
-class PCAConfig:
-    """Configuration for PCA feature reduction."""
-    n_components: int = 20
-    whiten: bool = True
-    random_state: int = 42
-    
-    def validate(self) -> None:
-        """Validate PCA configuration parameters."""
-        if self.n_components < 1:
-            raise ValueError(f"n_components must be >= 1, got {self.n_components}")
-        if self.random_state < 0:
-            raise ValueError(f"random_state must be >= 0, got {self.random_state}")
-
-
-@dataclass
-class VAEConfig:
-    """Configuration for VAE feature reduction and training."""
-    latent_dim: Optional[int] = None
-    hidden_dim: int = 512
-    dropout: float = 0.2
-    epochs: int = 30
-    batch_size: int = 128
-    lr: float = 1e-3
-    weight_decay: float = 0.0
-    beta: float = 2.0
-    alpha: float = 0.5
-    early_stopping: bool = True
-    patience: int = 5
-    seed: int = 42
-    score_mode: str = "gmm_mu"  # 'gmm_mu' | 'recon_kl' | 'hybrid'
-    hybrid_w_gmm: float = 0.5
-    hybrid_w_recon: float = 0.5
-    finetune_encoder_layers: int = 0
-    encoder_lr: float = 3e-5
-    
-    def validate(self) -> None:
-        """Validate VAE configuration parameters."""
-        if self.hidden_dim < 1:
-            raise ValueError(f"hidden_dim must be >= 1, got {self.hidden_dim}")
-        if not 0 <= self.dropout < 1:
-            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
-        if self.epochs < 1:
-            raise ValueError(f"epochs must be >= 1, got {self.epochs}")
-        if self.batch_size < 1:
-            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
-        if self.lr <= 0:
-            raise ValueError(f"lr must be > 0, got {self.lr}")
-        if self.score_mode not in ("gmm_mu", "recon_kl", "hybrid"):
-            raise ValueError(f"score_mode must be one of 'gmm_mu', 'recon_kl', 'hybrid', got {self.score_mode}")
-        if self.hybrid_w_gmm < 0 or self.hybrid_w_recon < 0:
-            raise ValueError(f"Hybrid weights must be non-negative")
-
-
-@dataclass
-class GMMConfig:
-    """Configuration for Gaussian Mixture Model."""
-    Ks: Tuple[int, ...] = field(default_factory=lambda: (1, 2, 3, 4, 5))
-    covariance_type: str = "full"
-    reg_covar: float = 1e-5
-    max_iter: int = 100
-    random_state: int = 42
-    
-    def validate(self) -> None:
-        """Validate GMM configuration parameters."""
-        if not self.Ks or min(self.Ks) < 1:
-            raise ValueError(f"Ks must contain positive integers, got {self.Ks}")
-        if self.covariance_type not in ("full", "tied", "diag", "spherical"):
-            raise ValueError(f"covariance_type must be one of 'full', 'tied', 'diag', 'spherical', got {self.covariance_type}")
-        if self.reg_covar < 0:
-            raise ValueError(f"reg_covar must be >= 0, got {self.reg_covar}")
-        if self.max_iter < 1:
-            raise ValueError(f"max_iter must be >= 1, got {self.max_iter}")
-
-
-@dataclass
-class ThresholdConfig:
-    """Configuration for threshold calibration."""
-    train_val_split: float = 0.95
-    quantile: float = 0.05
-    
-    def validate(self) -> None:
-        """Validate threshold configuration."""
-        if not 0 < self.train_val_split < 1:
-            raise ValueError(f"train_val_split must be in (0, 1), got {self.train_val_split}")
-        if not 0 <= self.quantile <= 1:
-            raise ValueError(f"quantile must be in [0, 1], got {self.quantile}")
-
-
-@dataclass
-class ModelConfig:
-    """Complete model configuration combining all sub-configs."""
-    ft_reduction: str = "PCA"  # "PCA" or "VAE"
-    pca: PCAConfig = field(default_factory=PCAConfig)
-    vae: VAEConfig = field(default_factory=VAEConfig)
-    gmm: GMMConfig = field(default_factory=GMMConfig)
-    threshold: ThresholdConfig = field(default_factory=ThresholdConfig)
-    file_extensions: Tuple[str, ...] = field(default_factory=lambda: ("*.png", "*.jpg", "*.jpeg"))
-    test_grid_cols: int = 5
-    run_timestamp: Optional[str] = None
-    runs_root: str = "training_runs"
-    save_vae_training: bool = True
-    
-    def validate(self) -> None:
-        """Validate entire configuration."""
-        if self.ft_reduction not in ("PCA", "VAE"):
-            raise ValueError(f"ft_reduction must be 'PCA' or 'VAE', got {self.ft_reduction}")
-        if self.test_grid_cols < 1:
-            raise ValueError(f"test_grid_cols must be >= 1, got {self.test_grid_cols}")
-        
-        self.pca.validate()
-        self.vae.validate()
-        self.gmm.validate()
-        self.threshold.validate()
-
-
-# ============================================================================
-# Abstract Base Classes (Strategy Pattern)
-# ============================================================================
-
-class FeatureReducer(ABC):
-    """Abstract base class for feature reduction strategies."""
-    
-    @abstractmethod
-    def fit(self, X: np.ndarray) -> np.ndarray:
-        """Fit reducer on training data and return reduced features."""
-        pass
-    
-    @abstractmethod
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        """Reduce features."""
-        pass
-    
-    @abstractmethod
-    def get_state(self) -> Dict[str, Any]:
-        """Get reducer state for serialization."""
-        pass
-    
-    @abstractmethod
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load reducer state from serialization."""
-        pass
-
-
-class AnomalyScorer(ABC):
-    """Abstract base class for anomaly scoring strategies."""
-    
-    @abstractmethod
-    def fit(self, Z: np.ndarray, X_original: Optional[np.ndarray] = None) -> None:
-        """Fit scorer on reduced features."""
-        pass
-    
-    @abstractmethod
-    def score(self, Z: np.ndarray, X_original: Optional[np.ndarray] = None) -> np.ndarray:
-        """Compute anomaly scores (higher = more normal)."""
-        pass
-    
-    @abstractmethod
-    def get_state(self) -> Dict[str, Any]:
-        """Get scorer state for serialization."""
-        pass
-    
-    @abstractmethod
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load scorer state from serialization."""
-        pass
-
-
-# ============================================================================
-# Concrete Feature Reducers
-# ============================================================================
-
-class PCAReducer(FeatureReducer):
-    """PCA-based feature reduction."""
-    
-    def __init__(self, config: PCAConfig, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.pca: Optional[PCA] = None
-    
-    def fit(self, X: np.ndarray) -> np.ndarray:
-        """Fit PCA and transform training data."""
-        n_samples, n_features = X.shape
-        n_components = max(1, min(n_samples - 1, n_features, self.config.n_components))
-        
-        self.logger.info(f"Fitting PCA with {n_components} components")
-        self.pca = PCA(
-            n_components=n_components,
-            whiten=self.config.whiten,
-            random_state=self.config.random_state,
-        )
-        return self.pca.fit_transform(X)
-    
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        """Transform data using fitted PCA."""
-        if self.pca is None:
-            raise RuntimeError("PCA not fitted. Call fit() first.")
-        return self.pca.transform(X)
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Get PCA state."""
-        return {
-            "pca": self.pca,
-            "config": asdict(self.config),
-        }
-    
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load PCA state."""
-        self.pca = state["pca"]
-        self.config = PCAConfig(**state["config"])
-
-
-class VAEReducer(FeatureReducer):
-    """VAE-based feature reduction."""
-    
-    def __init__(self, config: VAEConfig, device: str, logger: logging.Logger):
-        self.config = config
-        self.device = device
-        self.logger = logger
-        self.vae: Optional[VAEonCLIP] = None
-        self.history: Dict[str, List[float]] = {}
-    
-    def fit(self, X: np.ndarray, X_val: Optional[np.ndarray] = None) -> np.ndarray:
-        """Fit VAE and transform training data."""
-        d_in = X.shape[1]
-        d_lat = self.config.latent_dim or self.config.hidden_dim
-        
-        self.logger.info(f"Training VAE: d_in={d_in}, d_lat={d_lat}, d_hid={self.config.hidden_dim}")
-        
-        self.vae, self.history, _ = train_vae(
-            X, X_val,
-            d_in=d_in,
-            d_lat=int(d_lat),
-            d_hid=int(self.config.hidden_dim),
-            dropout=float(self.config.dropout),
-            epochs=int(self.config.epochs),
-            batch_size=int(self.config.batch_size),
-            lr=float(self.config.lr),
-            weight_decay=float(self.config.weight_decay),
-            beta=float(self.config.beta),
-            alpha=float(self.config.alpha),
-            early_stopping=bool(self.config.early_stopping),
-            patience=int(self.config.patience),
-            device=self.device,
-            seed=int(self.config.seed),
-            verbose=True,
-        )
-        
-        return vae_reduce_mu(self.vae, X).numpy()
-    
-    def transform(self, X: np.ndarray) -> np.ndarray:
-        """Transform data using fitted VAE."""
-        if self.vae is None:
-            raise RuntimeError("VAE not fitted. Call fit() first.")
-        return vae_reduce_mu(self.vae, X).numpy()
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Get VAE state."""
-        state = {
-            "config": asdict(self.config),
-            "history": self.history,
-            "vae": None,
-        }
-        if self.vae is not None:
-            state["vae"] = {
-                "state_dict": {k: v.cpu() for k, v in self.vae.state_dict().items()},
-                "d_in": self.vae.enc[0].in_features,
-                "d_lat": self.vae.mu.out_features,
-                "d_hid": self.vae.enc[0].out_features,
-                "dropout": self.config.dropout,
-            }
-        return state
-    
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load VAE state."""
-        self.config = VAEConfig(**state["config"])
-        self.history = state.get("history", {})
-        if state.get("vae"):
-            vae_info = state["vae"]
-            self.vae = VAEonCLIP(
-                d_in=vae_info["d_in"],
-                d_lat=vae_info["d_lat"],
-                d_hid=vae_info["d_hid"],
-                dropout=vae_info["dropout"],
-            )
-            self.vae.load_state_dict(vae_info["state_dict"])
-
-
-# ============================================================================
-# Concrete Anomaly Scorers
-# ============================================================================
-
-class GMMScorer(AnomalyScorer):
-    """Gaussian Mixture Model-based anomaly scoring."""
-    
-    def __init__(self, config: GMMConfig, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.gmm: Optional[GaussianMixture] = None
-    
-    def fit(self, Z: np.ndarray, X_original: Optional[np.ndarray] = None) -> None:
-        """Fit GMM on reduced features."""
-        best_gmm = None
-        best_bic = np.inf
-        
-        for k in self.config.Ks:
-            gmm = GaussianMixture(
-                n_components=k,
-                covariance_type=self.config.covariance_type,
-                reg_covar=self.config.reg_covar,
-                max_iter=self.config.max_iter,
-                random_state=self.config.random_state,
-            )
-            gmm.fit(Z)
-            bic = gmm.bic(Z)
-            self.logger.debug(f"k={k}: BIC={bic:.4f}")
-            
-            if bic < best_bic:
-                best_bic = bic
-                best_gmm = gmm
-        
-        self.gmm = best_gmm
-        self.logger.info(f"Selected GMM with k={best_gmm.n_components}")
-    
-    def score(self, Z: np.ndarray, X_original: Optional[np.ndarray] = None) -> np.ndarray:
-        """Compute log-likelihood scores."""
-        if self.gmm is None:
-            raise RuntimeError("GMM not fitted. Call fit() first.")
-        return self.gmm.score_samples(Z)
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Get GMM state."""
-        return {
-            "gmm": self.gmm,
-            "config": asdict(self.config),
-        }
-    
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load GMM state."""
-        self.gmm = state["gmm"]
-        self.config = GMMConfig(**state["config"])
-
-
-class ReconstructionScorer(AnomalyScorer):
-    """Reconstruction error-based anomaly scoring for VAE."""
-    
-    def __init__(self, config: VAEConfig, vae: Optional["VAEonCLIP"], logger: logging.Logger):
-        self.config = config
-        self.vae = vae
-        self.logger = logger
-        self._recon_inv_sigma2: Optional[np.ndarray] = None
-        self._recon_const: float = 0.0
-    
-    def fit(self, Z: np.ndarray, X_original: np.ndarray) -> None:
-        """Fit reconstruction variance on training data reconstructions."""
-        if X_original is None or self.vae is None:
-            self.logger.warning("X_original or VAE not provided; skipping reconstruction variance fitting")
-            return
-        
-        # Compute reconstructions and residuals
-        try:
-            self.vae.eval()
-            with torch.no_grad():
-                X_torch = torch.from_numpy(X_original).float()
-                # Move to same device as VAE
-                device = next(self.vae.parameters()).device
-                X_torch = X_torch.to(device)
-                X_hat, _, _ = self.vae(X_torch)
-                X_hat_np = X_hat.cpu().numpy()
-            
-            # Compute variance-aware log-likelihood parameters
-            resid = X_hat_np - X_original
-            sigma2 = resid.var(axis=0) + 1e-6
-            self._recon_inv_sigma2 = 1.0 / sigma2
-            self._recon_const = 0.5 * np.sum(np.log(2 * np.pi * sigma2))
-            self.logger.info("Reconstruction variance fitted from training data")
-        except Exception as e:
-            self.logger.warning(f"Failed to compute reconstruction variance: {e}")
-            self._recon_inv_sigma2 = None
-            self._recon_const = 0.0
-    
-    def score(self, Z: np.ndarray, X_original: np.ndarray) -> np.ndarray:
-        """Compute reconstruction log-likelihood scores."""
-        if X_original is None or self.vae is None:
-            self.logger.warning("Cannot compute reconstruction scores without original features and VAE")
-            return np.zeros(len(Z))
-        
-        if self._recon_inv_sigma2 is None:
-            self.logger.warning("Reconstruction variance not fitted; using simple MSE")
-            return self._compute_simple_recon_score(X_original)
-        
-        try:
-            self.vae.eval()
-            with torch.no_grad():
-                X_torch = torch.from_numpy(X_original).float()
-                # Move to same device as VAE
-                device = next(self.vae.parameters()).device
-                X_torch = X_torch.to(device)
-                X_hat, _, _ = self.vae(X_torch)
-                X_hat_np = X_hat.cpu().numpy()
-            
-            # Variance-aware log-likelihood
-            resid = X_hat_np - X_original
-            scores = -(0.5 * (resid * resid * self._recon_inv_sigma2).sum(axis=1) + self._recon_const)
-            return scores
-        except Exception as e:
-            self.logger.error(f"Error computing reconstruction scores: {e}")
-            return self._compute_simple_recon_score(X_original)
-    
-    def _compute_simple_recon_score(self, X_original: np.ndarray) -> np.ndarray:
-        """Fallback: simple MSE-based scoring."""
-        try:
-            self.vae.eval()
-            with torch.no_grad():
-                X_torch = torch.from_numpy(X_original).float()
-                # Move to same device as VAE
-                device = next(self.vae.parameters()).device
-                X_torch = X_torch.to(device)
-                X_hat, _, _ = self.vae(X_torch)
-                X_hat_np = X_hat.cpu().numpy()
-            return -np.mean((X_hat_np - X_original) ** 2, axis=1)
-        except Exception:
-            return np.zeros(len(X_original))
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Get reconstruction scorer state."""
-        return {
-            "recon_inv_sigma2": self._recon_inv_sigma2,
-            "recon_const": self._recon_const,
-            "config": asdict(self.config),
-        }
-    
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load reconstruction scorer state."""
-        self._recon_inv_sigma2 = state.get("recon_inv_sigma2")
-        self._recon_const = state.get("recon_const", 0.0)
-        self.config = VAEConfig(**state["config"])
-
-
-class HybridScorer(AnomalyScorer):
-    """Hybrid scoring combining GMM and reconstruction scores."""
-    
-    def __init__(
-        self, 
-        config: VAEConfig, 
-        gmm_scorer: GMMScorer,
-        recon_scorer: ReconstructionScorer,
-        logger: logging.Logger
-    ):
-        self.config = config
-        self.gmm_scorer = gmm_scorer
-        self.recon_scorer = recon_scorer
-        self.logger = logger
-        
-        # Normalization parameters (computed on validation set)
-        self._gmm_mean: float = 0.0
-        self._gmm_std: float = 1.0
-        self._recon_mean: float = 0.0
-        self._recon_std: float = 1.0
-        
-        # Learned classifier for hybrid scoring
-        self._scaler: Optional[StandardScaler] = None
-        self._classifier: Optional[LogisticRegression] = None
-    
-    def fit(self, Z: np.ndarray, X_original: np.ndarray) -> None:
-        """
-        Fit hybrid scorer: normalize scores and optionally train logistic regression.
-        
-        Args:
-            Z: Reduced features
-            X_original: Original features for reconstruction scoring
-        """
-        # Get GMM scores
-        if self.gmm_scorer.gmm is None:
-            self.logger.warning("GMM not fitted; cannot use hybrid scoring")
-            return
-        
-        gmm_scores = self.gmm_scorer.score(Z, X_original)
-        
-        # Get reconstruction scores
-        recon_scores = self.recon_scorer.score(Z, X_original)
-        
-        # Store normalization statistics
-        eps = 1e-8
-        self._gmm_mean = float(np.mean(gmm_scores))
-        self._gmm_std = float(np.std(gmm_scores) + eps)
-        self._recon_mean = float(np.mean(recon_scores))
-        self._recon_std = float(np.std(recon_scores) + eps)
-        
-        self.logger.info(
-            f"Hybrid scorer fitted: GMM μ={self._gmm_mean:.4f}±{self._gmm_std:.4f}, "
-            f"Recon μ={self._recon_mean:.4f}±{self._recon_std:.4f}"
-        )
-        
-        # Try to train learned hybrid classifier
-        try:
-            gmm_z = (gmm_scores - self._gmm_mean) / self._gmm_std
-            recon_z = (recon_scores - self._recon_mean) / self._recon_std
-            
-            # Stack features (assume validation data is all normal, label=0)
-            S = np.c_[gmm_z, recon_z]
-            y = np.zeros(len(S), dtype=int)
-            
-            # Train logistic regression
-            self._scaler = StandardScaler().fit(S)
-            S_scaled = self._scaler.transform(S)
-            
-            self._classifier = LogisticRegression(
-                max_iter=1000,
-                class_weight='balanced',
-                random_state=self.config.seed
-            )
-            self._classifier.fit(S_scaled, y)
-            
-            self.logger.info("Hybrid logistic regression classifier trained successfully")
-        except Exception as e:
-            self.logger.warning(f"Failed to train hybrid classifier: {e}. Using weighted average fallback.")
-            self._scaler = None
-            self._classifier = None
-    
-    def score(self, Z: np.ndarray, X_original: np.ndarray) -> np.ndarray:
-        """
-        Compute hybrid anomaly scores.
-        
-        Returns:
-            Normalized hybrid scores (higher = more normal)
-        """
-        # Get component scores
-        gmm_scores = self.gmm_scorer.score(Z, X_original)
-        recon_scores = self.recon_scorer.score(Z, X_original)
-        
-        # Normalize
-        eps = 1e-8
-        gmm_z = (gmm_scores - self._gmm_mean) / (self._gmm_std if self._gmm_std != 0 else 1.0)
-        recon_z = (recon_scores - self._recon_mean) / (self._recon_std if self._recon_std != 0 else 1.0)
-        
-        # Use learned classifier if available
-        if self._scaler is not None and self._classifier is not None:
-            try:
-                S = np.c_[gmm_z, recon_z]
-                S_scaled = self._scaler.transform(S)
-                proba = self._classifier.predict_proba(S_scaled)
-                # Return probability of normal class (class 0)
-                return proba[:, 0]
-            except Exception as e:
-                self.logger.warning(f"Error using hybrid classifier: {e}. Using weighted sum.")
-        
-        # Fallback: weighted sum
-        w_gmm = self.config.hybrid_w_gmm
-        w_recon = self.config.hybrid_w_recon
-        total_weight = w_gmm + w_recon
-        
-        if total_weight > 0:
-            scores = (w_gmm * gmm_z + w_recon * recon_z) / total_weight
-        else:
-            scores = 0.5 * gmm_z + 0.5 * recon_z
-        
-        return scores
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Get hybrid scorer state."""
-        state = {
-            "gmm_mean": self._gmm_mean,
-            "gmm_std": self._gmm_std,
-            "recon_mean": self._recon_mean,
-            "recon_std": self._recon_std,
-            "config": asdict(self.config),
-            "scaler": self._scaler,
-            "classifier": self._classifier,
-        }
-        return state
-    
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Load hybrid scorer state."""
-        self._gmm_mean = state.get("gmm_mean", 0.0)
-        self._gmm_std = state.get("gmm_std", 1.0)
-        self._recon_mean = state.get("recon_mean", 0.0)
-        self._recon_std = state.get("recon_std", 1.0)
-        self._scaler = state.get("scaler")
-        self._classifier = state.get("classifier")
-        self.config = VAEConfig(**state["config"])
-
-
-# ============================================================================
-# Threshold Calibration
-# ============================================================================
-
-class ThresholdCalibrator:
-    """Calibrate decision threshold for anomaly detection."""
-    
-    def __init__(self, config: ThresholdConfig, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.tau: float = 0.0
-    
-    def calibrate(self, scores: np.ndarray, labels: Optional[np.ndarray] = None) -> float:
-        """
-        Calibrate threshold using validation scores.
-        
-        Args:
-            scores: Anomaly scores (higher = more normal)
-            labels: Optional labels for F1-based calibration (0=normal, 1=anomalous)
-        
-        Returns:
-            Optimal threshold tau
-        """
-        if len(scores) < 3:
-            self.logger.warning("Very small validation set for threshold calibration")
-            self.tau = float(np.min(scores)) if len(scores) > 0 else -1e9
-            return self.tau
-        
-        if labels is not None and len(np.unique(labels)) > 1:
-            # F1-based calibration
-            self.tau = self._calibrate_by_f1(scores, labels)
-        else:
-            # Quantile-based calibration
-            self.tau = float(np.quantile(scores, self.config.quantile))
-        
-        self.logger.info(f"Threshold calibrated: tau={self.tau:.6f}")
-        return self.tau
-    
-    @staticmethod
-    def _calibrate_by_f1(scores: np.ndarray, y: np.ndarray) -> float:
-        """Find threshold maximizing F1 score."""
-        qs = np.linspace(0.01, 0.99, 99)
-        grid = np.quantile(scores, qs)
-        best_f1 = -1
-        best_tau = float(np.quantile(scores, 0.05))
-        
-        for t in grid:
-            y_pred = (scores < t).astype(int)
-            tp = np.sum((y == 1) & (y_pred == 1))
-            fp = np.sum((y == 0) & (y_pred == 1))
-            fn = np.sum((y == 1) & (y_pred == 0))
-            
-            prec = tp / (tp + fp + 1e-9)
-            rec = tp / (tp + fn + 1e-9)
-            f1 = 2 * prec * rec / (prec + rec + 1e-9)
-            
-            if f1 > best_f1:
-                best_f1 = f1
-                best_tau = t
-        
-        return float(best_tau)
-
-
-# ============================================================================
-# Logging Configuration
-# ============================================================================
-
-def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Configure and return a logger."""
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        ))
-        logger.addHandler(handler)
-    
-    return logger
-
-
-# ============================================================================
-# Main Model Class (Simplified with Dependency Inversion)
-# ============================================================================
 
 class AnomalyDetectionModel:
     """
@@ -977,9 +300,13 @@ class AnomalyDetectionModel:
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
         
         # Visualizations
-        self._save_test_visualizations(images, verdicts, scores, labels, output_folder)
-        self._save_metrics_report(
-            tp, fp, fn, tn, accuracy, precision, recall, f1, output_folder
+        save_test_visualizations(
+            images, verdicts, scores, labels, output_folder, 
+            self.threshold, self.config.test_grid_cols, self.logger
+        )
+        save_metrics_report(
+            tp, fp, fn, tn, accuracy, precision, recall, f1, 
+            self.threshold, output_folder, self.logger
         )
         
         # Summary
@@ -999,6 +326,8 @@ class AnomalyDetectionModel:
         """Save model to disk."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        
+        from dataclasses import asdict
         
         state = {
             "config": asdict(self.config),
@@ -1113,101 +442,135 @@ class AnomalyDetectionModel:
             feat = self.vision_encoder.to(self.device)(x).float().cpu().detach().numpy()
         return feat
     
-    def _save_test_visualizations(
-        self,
-        images: List[Image.Image],
-        verdicts: List[str],
-        scores: List[float],
-        labels: List[str],
-        output_folder: Path,
-    ) -> None:
-        """Save test result visualizations."""
-        if not images:
-            return
-        
-        n = len(images)
-        cols = self.config.test_grid_cols
-        rows = (n + cols - 1) // cols
-        
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 4, rows * 4))
-        if n == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten()
-        
-        for idx, (ax, img, verdict, score, label) in enumerate(
-            zip(axes, images, verdicts, scores, labels)
-        ):
-            ax.imshow(img)
-            ax.axis("off")
-            color = "green" if "✓" in verdict else "red"
-            text = f"{verdict}\n{label}\nScore: {score:.4f}\nτ: {self.threshold:.4f}"
-            ax.text(
-                0.5, -0.05, text,
-                transform=ax.transAxes,
-                fontsize=10,
-                verticalalignment="top",
-                horizontalalignment="center",
-                bbox=dict(boxstyle="round", facecolor=color, alpha=0.3),
-            )
-        
-        for idx in range(n, len(axes)):
-            axes[idx].axis("off")
-        
-        plt.tight_layout()
-        viz_path = output_folder / "test_results_images.png"
-        plt.savefig(viz_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        self.logger.info(f"Visualizations saved to {viz_path}")
+    # ========================================================================
+    # Visualization Methods
+    # ========================================================================
     
-    def _save_metrics_report(
+    def plot_with_model_2d(
         self,
-        tp: int, fp: int, fn: int, tn: int,
-        accuracy: float, precision: float, recall: float, f1: float,
-        output_folder: Path,
-    ) -> None:
-        """Save metrics report with confusion matrix."""
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        
-        # Confusion matrix
-        cm = np.array([[tn, fp], [fn, tp]])
-        sns.heatmap(
-            cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
-            xticklabels=['Normal', 'Anomaly'],
-            yticklabels=['Normal', 'Anomaly'],
-            cbar_kws={'label': 'Count'},
-        )
-        axes[0].set_xlabel('Predicted', fontweight='bold')
-        axes[0].set_ylabel('True', fontweight='bold')
-        axes[0].set_title('Confusion Matrix', fontweight='bold')
-        
-        # Metrics
-        metrics_text = f"""
-METRICS
-
-Accuracy: {accuracy:.2f}%
-Precision: {precision:.2f}%
-Recall: {recall:.2f}%
-F1 Score: {f1:.4f}
-
-TP: {tp}  FP: {fp}
-FN: {fn}  TN: {tn}
-
-Threshold: {self.threshold:.6f}
+        normal_paths: Union[str, Path, List[Union[str, Path]]],
+        anomaly_folders: Optional[List[Union[str, Path]]] = None,
+        batch_size: int = 64,
+        reduction_method: str = "pca",
+        figsize: Tuple[int, int] = (14, 10),
+    ) -> plt.Figure:
         """
-        axes[1].text(
-            0.1, 0.5, metrics_text,
-            fontsize=11, family='monospace',
-            verticalalignment='center',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-        )
-        axes[1].axis("off")
+        Visualize model predictions in 2D space with decision boundaries.
         
-        plt.tight_layout()
-        report_path = output_folder / "metrics_report.png"
-        plt.savefig(report_path, dpi=150, bbox_inches="tight")
-        plt.close()
-        self.logger.info(f"Metrics report saved to {report_path}")
+        Works with both PCA and VAE feature reduction:
+        - If ft_reduction="PCA": uses fitted PCA to project CLIP features directly
+        - If ft_reduction="VAE": uses VAE to reduce to latent space, then projects to 2D
+        
+        Args:
+            normal_paths: Path(s) to normal images (string, Path, or list)
+            anomaly_folders: List of paths to anomaly folders
+            batch_size: Batch size for encoding (default 64)
+            reduction_method: '2d' reduction method ('pca' or 'umap'; default 'pca')
+            figsize: Figure size (default (14, 10))
+        
+        Returns:
+            matplotlib Figure object
+        
+        Example:
+            >>> model.plot_with_model_2d(
+            ...     normal_paths="path/to/normal",
+            ...     anomaly_folders=["path/to/anomaly1", "path/to/anomaly2"],
+            ...     reduction_method="pca"
+            ... )
+            >>> plt.show()
+        """
+        def collect(paths_or_root):
+            """Collect image paths from input."""
+            if isinstance(paths_or_root, (list, tuple)):
+                return [Path(p) for p in paths_or_root]
+            root = Path(paths_or_root)
+            exts = ("*.jpg", "*.jpeg", "*.png")
+            return [p for ext in exts for p in root.rglob(ext)]
+        
+        def encode(paths: List[Path]) -> Tuple[np.ndarray, List[Path]]:
+            """Encode images to CLIP features."""
+            feats, keep = [], []
+            with torch.no_grad():
+                batch, stash = [], []
+                for p in paths:
+                    try:
+                        img = Image.open(p).convert("RGB")
+                        batch.append(self.preprocess(img))
+                        stash.append(p)
+                    except Exception:
+                        continue
+                    if len(batch) == batch_size:
+                        x = torch.stack(batch).to(self.device)
+                        f = self.vision_encoder(x).float()
+                        feats.append(f.cpu())
+                        keep += stash
+                        batch, stash = [], []
+                if batch:
+                    x = torch.stack(batch).to(self.device)
+                    f = self.vision_encoder(x).float()
+                    feats.append(f.cpu())
+                    keep += stash
+            
+            X = np.concatenate([t.numpy() for t in feats], axis=0) if feats else np.empty((0, 512))
+            return X, keep
+        
+        # Encode all image sets
+        self.logger.info("Encoding normal images...")
+        Xn, paths_n = encode(collect(normal_paths))
+        self.logger.info(f"Encoded {len(paths_n)} normal images")
+        
+        an_sets = []
+        anomaly_folders = anomaly_folders or []
+        for folder in anomaly_folders:
+            self.logger.info(f"Encoding anomaly folder: {folder}")
+            Xa, pa = encode(collect(folder))
+            an_sets.append((str(folder), Xa, pa))
+            self.logger.info(f"Encoded {len(pa)} anomaly images from {folder}")
+        
+        # Prepare data for visualization
+        normal_data = (Xn, paths_n)
+        anomaly_data = [(name, Xa, pa) for name, Xa, pa in an_sets]
+        
+        # Use utility function to create visualization
+        fig = plot_model_2d_visualization(
+            reducer=self.reducer,
+            scorer=self.scorer,
+            threshold=self.threshold,
+            normal_data=normal_data,
+            anomaly_data=anomaly_data,
+            ft_reduction=self.config.ft_reduction,
+            reduction_method=reduction_method,
+            figsize=figsize,
+            logger=self.logger,
+        )
+        
+        return fig
+    
+    def plot_with_model_pca_2d(
+        self,
+        normal_paths: Union[str, Path, List[Union[str, Path]]],
+        anomaly_folders: Optional[List[Union[str, Path]]] = None,
+        batch_size: int = 64,
+    ) -> plt.Figure:
+        """
+        Backward compatibility wrapper for plot_with_model_2d() using PCA reduction.
+        
+        Use plot_with_model_2d() with reduction_method="pca" instead.
+        
+        Args:
+            normal_paths: Path(s) to normal images
+            anomaly_folders: List of paths to anomaly folders
+            batch_size: Batch size for encoding (default 64)
+        
+        Returns:
+            matplotlib Figure object
+        """
+        return self.plot_with_model_2d(
+            normal_paths=normal_paths,
+            anomaly_folders=anomaly_folders,
+            batch_size=batch_size,
+            reduction_method="pca"
+        )
 
 
 # Backward compatibility alias
