@@ -1,0 +1,129 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE specific
+.pylintrc
+.flake8
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Machine Learning specific
+# Model weights and checkpoints
+*.pth
+*.pt
+*.h5
+*.pb
+*.onnx
+*.pkl
+*.pickle
+
+# Data files (large)
+*.csv
+*.tsv
+*.json
+*.npy
+*.npz
+
+# Training outputs and logs
+runs/
+training_runs/
+logs/
+checkpoints/
+*.log
+
+# Dataset directories
+trento_house_data/
+data/
+datasets/
+tmp/
+temp/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS specific
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Generated files
+*.pyc
+*.pyo
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Local testing files
+local_test/
+test_output/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+temp/
+tmp/
